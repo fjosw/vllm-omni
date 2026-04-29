@@ -1,0 +1,23 @@
+# Kyutai Speech-to-Text: a single autoregressive LLM stage. The 1B and
+# 2.6B checkpoints both expose ``max_position_embeddings = 375`` (~30s of
+# audio at 12.5 Hz), and the model emits one text token per audio frame.
+
+pipeline: kyutai_speech_to_text
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.7
+    enforce_eager: true
+    max_model_len: 375
+    max_num_batched_tokens: 375
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 374
+      seed: 42
+      detokenize: true

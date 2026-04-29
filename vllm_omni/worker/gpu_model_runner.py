@@ -1151,7 +1151,14 @@ class OmniGPUModelRunner(GPUModelRunner):
         This helper is intentionally small and self-contained so that it can be
         unit-tested to prevent regressions when updating MiMoAudio handling.
         """
-        if req_state is None or self.model.__class__.__name__ != "MiMoAudioForConditionalGeneration":
+        # Models with a per-step preprocess hook need ``mm_features``
+        # attached on every step so additive context (e.g. Kyutai's
+        # per-frame audio bias) can be injected.
+        eligible_models = {
+            "MiMoAudioForConditionalGeneration",
+            "KyutaiSpeechToTextForConditionalGeneration",
+        }
+        if req_state is None or self.model.__class__.__name__ not in eligible_models:
             return req_infos
 
         # Always operate on a dict copy to avoid mutating shared instances.

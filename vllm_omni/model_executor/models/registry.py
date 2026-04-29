@@ -102,6 +102,12 @@ _OMNI_MODELS = {
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
     ),
+    ## kyutai_speech_to_text
+    "KyutaiSpeechToTextForConditionalGeneration": (
+        "kyutai_speech_to_text",
+        "kyutai_speech_to_text",
+        "KyutaiSpeechToTextForConditionalGeneration",
+    ),
     ## mimo_audio
     "MiMoAudioModel": (
         "mimo_audio",

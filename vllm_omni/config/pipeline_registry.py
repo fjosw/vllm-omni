@@ -73,6 +73,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.cosyvoice3.pipeline",
         "COSYVOICE3_PIPELINE",
     ),
+    "kyutai_speech_to_text": (
+        "vllm_omni.model_executor.models.kyutai_speech_to_text.pipeline",
+        "KYUTAI_SPEECH_TO_TEXT_PIPELINE",
+    ),
     "mimo_audio": (
         "vllm_omni.model_executor.models.mimo_audio.pipeline",
         "MIMO_AUDIO_PIPELINE",

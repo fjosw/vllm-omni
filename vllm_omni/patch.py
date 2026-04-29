@@ -4,6 +4,43 @@ from functools import cached_property
 from aenum import extend_enum
 from vllm.config import ModelConfig as _OriginalModelConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
+
+# =============================================================================
+# Patch MODEL_ARCH_CONFIG_CONVERTORS to widen Kyutai STT's input vocab
+# =============================================================================
+# WHY: Kyutai STT's *input* embedding table covers text + per-codebook
+# audio tokens + a pad row, but the LM head outputs over the text vocab
+# only. vLLM's input-id validator and prefill bookkeeping read
+# ``ModelConfig.get_vocab_size()`` (= ``model_arch_config.vocab_size``,
+# copied from ``hf_config.vocab_size`` at ``ModelConfig.__init__``
+# time). Without widening, the audio-pad placeholder (id 69569) and the
+# BOS (id 48000) are flagged as out-of-vocabulary. We register a
+# convertor for ``model_type == "kyutai_speech_to_text"`` that returns
+# the embedding-table size for input validation while preserving the
+# original text-vocab size on ``config.text_vocab_size`` for the LM
+# head.
+try:
+    from vllm.transformers_utils.model_arch_config_convertor import (
+        MODEL_ARCH_CONFIG_CONVERTORS,
+        ModelArchConfigConvertorBase,
+    )
+
+    if "kyutai_speech_to_text" not in MODEL_ARCH_CONFIG_CONVERTORS:
+
+        class _KyutaiSpeechToTextConvertor(ModelArchConfigConvertorBase):
+            def get_vocab_size(self) -> int:
+                cfg = self.hf_text_config
+                text_vocab = int(getattr(cfg, "text_vocab_size", cfg.vocab_size))
+                num_codebooks = int(getattr(cfg, "num_codebooks", 0))
+                codebook_vocab = int(getattr(cfg, "codebook_vocab_size", 0))
+                full = text_vocab + num_codebooks * codebook_vocab + 1
+                cfg.text_vocab_size = text_vocab
+                cfg.vocab_size = full
+                return full
+
+        MODEL_ARCH_CONFIG_CONVERTORS["kyutai_speech_to_text"] = _KyutaiSpeechToTextConvertor
+except ImportError:
+    pass
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
 )
