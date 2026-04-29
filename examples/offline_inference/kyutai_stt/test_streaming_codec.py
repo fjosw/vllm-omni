@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Verify Mimi streaming-encode equivalence.
+"""Probe Mimi streaming-encode behaviour.
 
-Encodes the same waveform in (a) one shot and (b) chunks of ``frame_size``
-samples, and checks that the resulting per-frame audio bias is bitwise
-identical. Streaming equivalence is a prerequisite for the real-time
-transcription API: any divergence here propagates directly to the LM.
+Encodes the same waveform in (a) one shot and (b) chunks via Mimi's
+``padding_cache`` + ``encoder_past_key_values`` streaming path, and
+reports how much the resulting code stream diverges. Empirically the two
+paths are NOT bitwise equivalent (only the first chunk is identical
+across both calls; cross-chunk handoff loses some causal-conv context),
+which is why the real-time API uses a buffered-re-encode strategy
+instead of true streaming Mimi inside ``kyutai_preprocess``.
+
+Run this script when revisiting the streaming-codec assumption.
 
 Usage:
     python examples/offline_inference/kyutai_stt/test_streaming_codec.py \\
-        --model /path/to/stt-1b-en_fr-trfs \\
         --audio-path /path/to/audio.wav
 """
 
@@ -86,11 +90,10 @@ def main() -> None:
 
     diff = (codes_oneshot != codes_streamed).sum().item()
     total = codes_oneshot.numel()
-    if diff == 0:
-        print(f"PASS: streamed codes match one-shot exactly ({total} elements)")
-    else:
-        print(f"FAIL: {diff}/{total} codes differ ({100 * diff / total:.2f}%)")
-        raise SystemExit(1)
+    print(f"differing codes: {diff}/{total} ({100 * diff / total:.2f}%)")
+    if diff != 0:
+        print("Streaming Mimi is NOT bitwise-equivalent to one-shot encode at this checkpoint.")
+        print("The real-time API works around this via a buffered-re-encode strategy.")
 
 
 if __name__ == "__main__":
