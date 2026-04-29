@@ -34,12 +34,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import math
 import uuid
 from typing import Any
 
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from scipy.signal import resample_poly
 from vllm import SamplingParams
 from vllm.logger import init_logger
 
@@ -53,6 +55,14 @@ def _decode_pcm16_le(b64: str) -> np.ndarray:
     raw = base64.b64decode(b64)
     pcm = np.frombuffer(raw, dtype="<i2")
     return pcm.astype(np.float32) / 32768.0
+
+
+def _resample_to(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """Resample float32 mono audio with scipy (rational ratio polyphase)."""
+    if src_sr == dst_sr:
+        return audio
+    g = math.gcd(src_sr, dst_sr)
+    return resample_poly(audio, dst_sr // g, src_sr // g).astype(np.float32)
 
 
 def _build_app(omni: AsyncOmni, default_model: str, target_sr: int = 24000) -> FastAPI:
@@ -89,16 +99,7 @@ def _build_app(omni: AsyncOmni, default_model: str, target_sr: int = 24000) -> F
 
             audio = np.concatenate(audio_chunks)
             if sample_rate != target_sr:
-                # Caller is expected to send 24 kHz mono. Refuse rather than
-                # bring in a heavyweight resampler dependency in the example.
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "message": f"sample_rate must be {target_sr}, got {sample_rate}",
-                    }
-                )
-                await websocket.close()
-                return
+                audio = _resample_to(audio, sample_rate, target_sr)
 
             sampling_params = SamplingParams(
                 temperature=0.0,
