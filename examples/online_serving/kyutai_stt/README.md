@@ -89,16 +89,26 @@ first-token latency. Kyutai's intended **lockstep** mode emits one text
 token per 80 ms audio frame at ~80 ms per-token wall time. To reach that
 in this implementation we need:
 
-### 1. Use `add_streaming_update_async` instead of re-submission
+### 1. Scheduler change: don't clear output_token_ids on streaming update
 
 vllm-omni already exposes a streaming-input channel:
 `AsyncOmni.generate(prompt=AsyncGenerator[StreamingInput, None])` →
 each yielded chunk becomes an `add_streaming_update_async` to stage 0.
-For Kyutai we need each update to **extend the multimodal payload**
-(grow `multi_modal_data["audio"]`), and the runner side needs
-`kyutai_preprocess` to read `req_state.mm_features` on every step and
-append new frames to `_kyutai_audio_bias_full` rather than computing
-the bias once. This avoids the re-decode-from-scratch waste.
+However, `OmniSchedulerMixin._replace_session_with_streaming_update`
+(in `vllm_omni/core/sched/omni_scheduler_mixin.py`) currently **clears**
+`session._output_token_ids` and resets `num_computed_tokens = 0` on
+every update — it's designed for token-stream prompts that get
+replaced wholesale, not for an audio buffer that grows while the LM
+keeps decoding. For Kyutai we need an "append + keep-going" mode in the
+scheduler that:
+* extends `mm_features` with the new audio frames rather than replacing,
+* leaves the already-decoded text tokens alone,
+* signals to `kyutai_preprocess` to consume the new frames on the next
+  step (already trivial: the hook reads `_kyutai_next_pos` against
+  `_kyutai_audio_bias_full.shape[0]`).
+That's the missing piece for true lockstep. Without it, every
+streaming update functionally restarts the generation, which is what
+our re-submission path already does at the `AsyncOmni.generate` level.
 
 ### 2. Lossless chunked Mimi encode (or buffered re-encode)
 
