@@ -18,13 +18,17 @@ from __future__ import annotations
 import argparse
 
 import torch
-from transformers import AutoConfig, MimiModel
+from transformers import MimiModel
 from vllm.multimodal.media.audio import load_audio
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--codec",
+        default="kyutai/mimi",
+        help="Standalone Mimi checkpoint to load (the STT checkpoint embeds it but doesn't expose it as a sub-config).",
+    )
     parser.add_argument("--audio-path", required=True)
     parser.add_argument("--target-sr", type=int, default=24000)
     parser.add_argument("--device", default="cuda")
@@ -40,10 +44,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    codec = MimiModel.from_pretrained(args.model, subfolder="codec", dtype=torch.float32).to(args.device)
+    codec = MimiModel.from_pretrained(args.codec, dtype=torch.float32).to(args.device)
     codec.eval()
-    frame_size = int(cfg.codec_config.frame_size)
+    frame_size = int(codec.config.frame_size)
     chunk_samples = args.chunk_frames * frame_size
 
     audio, _ = load_audio(args.audio_path, sr=args.target_sr, mono=True)
