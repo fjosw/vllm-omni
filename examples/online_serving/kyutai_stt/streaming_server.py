@@ -243,6 +243,171 @@ def _build_app(
             except Exception:
                 pass
 
+    @app.websocket("/v1/realtime")
+    async def realtime_endpoint(websocket: WebSocket) -> None:
+        """OpenAI Realtime API mapping (transcription-only subset).
+
+        Implements the events client SDKs need for live transcription:
+            client -> server:
+                session.update
+                input_audio_buffer.append
+                input_audio_buffer.commit
+            server -> client:
+                session.created
+                conversation.item.input_audio_transcription.delta
+                conversation.item.input_audio_transcription.completed
+                error
+        """
+        await websocket.accept()
+        session_id = f"sess_{uuid.uuid4().hex[:12]}"
+        item_id = f"item_{uuid.uuid4().hex[:12]}"
+        await websocket.send_json(
+            {
+                "type": "session.created",
+                "session": {
+                    "id": session_id,
+                    "model": "kyutai-stt",
+                    "modalities": ["text"],
+                    "input_audio_format": "pcm16",
+                },
+            }
+        )
+
+        session = _SessionState(target_sr=target_sr)
+        session.input_sr = target_sr
+        commit_received = asyncio.Event()
+        committed_text = ""
+
+        async def reader() -> None:
+            nonlocal item_id
+            try:
+                while True:
+                    msg = await websocket.receive_json()
+                    msg_type = msg.get("type", "")
+                    if msg_type == "session.update":
+                        fmt = msg.get("session", {}).get("input_audio_format")
+                        if fmt and fmt != "pcm16":
+                            await websocket.send_json(
+                                {
+                                    "type": "error",
+                                    "error": {
+                                        "type": "invalid_request_error",
+                                        "message": f"Unsupported input_audio_format: {fmt}",
+                                    },
+                                }
+                            )
+                    elif msg_type == "input_audio_buffer.append":
+                        session.add_chunk(_decode_pcm16_le(msg.get("audio", "")))
+                    elif msg_type == "input_audio_buffer.commit":
+                        commit_received.set()
+                        session.audio_done.set()
+                        session.have_audio.set()
+                        return
+                    elif msg_type == "input_audio_buffer.clear":
+                        session.audio_chunks.clear()
+                    # Other event types are silently ignored: clients may send
+                    # response.create, conversation.item.create, etc. that
+                    # don't apply to a pure-transcription endpoint.
+            except WebSocketDisconnect:
+                session.closed = True
+                session.audio_done.set()
+                session.have_audio.set()
+                commit_received.set()
+
+        reader_task = asyncio.create_task(reader())
+
+        commit_interval_s = commit_interval_ms / 1000.0
+        cycle = 0
+        last_submitted_samples = 0
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(session.have_audio.wait(), timeout=commit_interval_s)
+                except asyncio.TimeoutError:
+                    pass
+                session.have_audio.clear()
+                if session.closed:
+                    break
+                n_input = session.total_input_samples()
+                is_done = session.audio_done.is_set()
+                if n_input == 0:
+                    if is_done:
+                        break
+                    continue
+                if n_input == last_submitted_samples and not is_done:
+                    continue
+
+                last_submitted_samples = n_input
+                cycle += 1
+                request_id = f"{session_id}-{cycle}"
+                audio = session.cumulative_audio()
+                sampling_params = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                    seed=42,
+                    detokenize=True,
+                )
+                prompt = {"prompt": "", "multi_modal_data": {"audio": [audio]}}
+
+                cycle_text = ""
+                async for stage_output in omni.generate(
+                    prompt,
+                    request_id=request_id,
+                    sampling_params_list=[sampling_params],
+                ):
+                    if stage_output.final_output_type != "text":
+                        continue
+                    request_output = stage_output.request_output
+                    if not request_output.outputs:
+                        continue
+                    cycle_text = (request_output.outputs[0].text or "").rstrip()
+                    if session.have_audio.is_set() and not is_done and session.total_input_samples() > n_input:
+                        try:
+                            await omni.abort(request_id)
+                        except Exception:
+                            pass
+                        break
+
+                if cycle_text:
+                    common = 0
+                    for i in range(min(len(committed_text), len(cycle_text))):
+                        if committed_text[i] != cycle_text[i]:
+                            break
+                        common += 1
+                    delta = cycle_text[common:]
+                    if delta:
+                        await websocket.send_json(
+                            {
+                                "type": "conversation.item.input_audio_transcription.delta",
+                                "item_id": item_id,
+                                "content_index": 0,
+                                "delta": delta,
+                            }
+                        )
+                    committed_text = cycle_text
+
+                if is_done and last_submitted_samples == n_input:
+                    break
+
+            await websocket.send_json(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": item_id,
+                    "content_index": 0,
+                    "transcript": committed_text,
+                }
+            )
+        finally:
+            reader_task.cancel()
+            try:
+                await reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
     @app.post("/v1/audio/transcriptions")
     async def transcriptions(
         file: UploadFile = File(...),
