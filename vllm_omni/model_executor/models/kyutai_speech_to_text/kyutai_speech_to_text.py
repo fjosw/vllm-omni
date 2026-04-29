@@ -380,13 +380,13 @@ class KyutaiSpeechToTextForConditionalGeneration(
                 loaded.add(f"codec_model.{n}")
         return loaded
 
-    def _audio_bos_bias(self, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    def _audio_bos_bias(self, device: torch.device) -> torch.Tensor:
         """One-row tensor placed at position 0 of the audio bias buffer."""
         embed = self.model.embed_tokens
         bos_codes = torch.full(
             (1, embed.num_codebooks),
             int(self.config.audio_bos_token_id),
-            dtype=dtype,
+            dtype=torch.long,
             device=device,
         )
         return embed.embed_audio_only(bos_codes)
@@ -441,8 +441,7 @@ class KyutaiSpeechToTextForConditionalGeneration(
         """One-shot bias for the full waveform. Output ``(1+T, hidden_size)``:
         index 0 is the audio-BOS bias; indices 1..T are the per-frame biases."""
         per_frame = self._encode_audio(input_values, device=device)
-        bos_bias = self._audio_bos_bias(dtype=per_frame.dtype, device=per_frame.device)
-        return torch.cat([bos_bias, per_frame], dim=0)
+        return torch.cat([self._audio_bos_bias(device), per_frame], dim=0)
 
     def kyutai_preprocess(
         self,
