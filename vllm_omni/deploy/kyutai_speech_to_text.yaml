@@ -8,7 +8,7 @@ dtype: bfloat16
 
 stages:
   - stage_id: 0
-    max_num_seqs: 1
+    max_num_seqs: 16
     gpu_memory_utilization: 0.7
     enforce_eager: true
     max_model_len: 375
