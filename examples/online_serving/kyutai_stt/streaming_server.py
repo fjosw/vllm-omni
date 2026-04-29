@@ -193,17 +193,27 @@ def _build_app(
                                 pass
                             break
 
-                    # Emit any new committed prefix.
-                    if cycle_text and cycle_text.startswith(session.committed_text):
-                        delta = cycle_text[len(session.committed_text) :]
+                    # Mid-stream the LM's hypothesis can change (e.g. punctuation
+                    # before a comma flips when more audio arrives), so we send the
+                    # full current transcript as an "update" rather than a strict
+                    # additive delta. We also compute and forward a stable-prefix
+                    # delta against the previously-committed transcript for clients
+                    # that want delta semantics.
+                    if cycle_text:
+                        await websocket.send_json({"type": "transcript.update", "text": cycle_text})
+                        # Find the longest common prefix with the previous transcript
+                        # so we can also emit a delta event.
+                        prev = session.committed_text
+                        common = 0
+                        for i in range(min(len(prev), len(cycle_text))):
+                            if prev[i] != cycle_text[i]:
+                                break
+                            common += 1
+                        if common < len(prev):
+                            await websocket.send_json({"type": "transcript.revise", "drop_chars": len(prev) - common})
+                        delta = cycle_text[common:]
                         if delta:
                             await websocket.send_json({"type": "transcript.delta", "text": delta})
-                            session.committed_text = cycle_text
-                    elif cycle_text and len(cycle_text) > len(session.committed_text):
-                        # The new hypothesis diverges from what we already showed; this
-                        # is rare with deterministic sampling but can happen when more
-                        # audio context shifts the LM's view of an earlier word.
-                        await websocket.send_json({"type": "transcript.delta", "text": cycle_text})
                         session.committed_text = cycle_text
 
                     if is_done and last_submitted_samples == n_input:

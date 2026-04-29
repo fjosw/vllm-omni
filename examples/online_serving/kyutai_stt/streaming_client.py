@@ -70,17 +70,24 @@ async def main() -> None:
 
         async def _read_replies() -> str:
             full = ""
+            # Render with carriage return so the visible line is always the
+            # latest hypothesis (no growing scrollback when the LM revises).
             while True:
                 try:
                     msg = json.loads(await ws.recv())
                 except websockets.ConnectionClosedOK:
                     break
                 t = msg.get("type")
-                if t == "transcript.delta":
-                    delta = msg.get("text", "")
-                    full += delta
-                    sys.stdout.write(delta)
+                if t == "transcript.update":
+                    full = msg.get("text", "")
+                    sys.stdout.write("\r\033[K" + full)
                     sys.stdout.flush()
+                elif t == "transcript.delta":
+                    # Already rendered via transcript.update; ignore.
+                    pass
+                elif t == "transcript.revise":
+                    # Already rendered via transcript.update; ignore.
+                    pass
                 elif t == "transcript.done":
                     sys.stdout.write("\n")
                     return msg.get("text", full)
