@@ -30,13 +30,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import io
 import math
 import uuid
 from typing import Any
 
 import numpy as np
+import soundfile as sf
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, PlainTextResponse
 from scipy.signal import resample_poly
 from vllm import SamplingParams
 from vllm.logger import init_logger
@@ -239,6 +242,59 @@ def _build_app(
                 await websocket.close()
             except Exception:
                 pass
+
+    @app.post("/v1/audio/transcriptions")
+    async def transcriptions(
+        file: UploadFile = File(...),
+        model: str = Form(""),
+        language: str | None = Form(None),
+        response_format: str = Form("json"),
+    ):
+        """OpenAI-compatible Whisper transcription endpoint.
+
+        POST a wav/flac/mp3/etc. file as ``multipart/form-data`` and receive
+        either a JSON ``{"text": "..."}`` body (``response_format=json``,
+        default) or the bare transcript (``response_format=text``).
+        """
+        del model  # We expose a single model per server.
+        del language  # Kyutai is en/fr only and detects automatically.
+        if response_format not in ("json", "text"):
+            raise HTTPException(status_code=400, detail=f"Unsupported response_format: {response_format}")
+
+        raw = await file.read()
+        try:
+            audio, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not decode audio: {exc}") from exc
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        audio = _resample_to(audio.astype(np.float32), int(sr), target_sr)
+
+        request_id = f"stt-rest-{uuid.uuid4().hex[:8]}"
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=max_tokens,
+            seed=42,
+            detokenize=True,
+        )
+        prompt = {"prompt": "", "multi_modal_data": {"audio": [audio]}}
+
+        text = ""
+        async for stage_output in omni.generate(
+            prompt,
+            request_id=request_id,
+            sampling_params_list=[sampling_params],
+        ):
+            if stage_output.final_output_type != "text":
+                continue
+            request_output = stage_output.request_output
+            if request_output.outputs:
+                text = request_output.outputs[0].text or ""
+
+        text = text.strip()
+        if response_format == "text":
+            return PlainTextResponse(text)
+        return JSONResponse({"text": text})
 
     @app.get("/health")
     def health() -> dict[str, Any]:
