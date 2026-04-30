@@ -37,8 +37,8 @@ from typing import Any
 
 import numpy as np
 import soundfile as sf
-import uvicorn
 import torch
+import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 from scipy.signal import resample_poly
