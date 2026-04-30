@@ -95,6 +95,12 @@ class _SessionState:
 
 
 _MIMI_FRAME_SIZE = 1920  # samples per Mimi frame at 24 kHz / 12.5 Hz
+# The HF feature extractor pads each audio with `audio_delay_seconds + 1.0`s
+# of trailing silence (see KyutaiSpeechToTextFeatureExtractor._pad). For the
+# 1B en/fr checkpoint that's 0.5 + 1.0 = 1.5 s ≈ 19 frames. We add a small
+# extra safety margin for tokens still in the model's delay pipeline.
+_FE_PAD_FRAMES = 19
+_HORIZON_SAFETY_FRAMES = 6
 
 
 def _max_tokens_for_audio(audio: np.ndarray, frame_size: int = _MIMI_FRAME_SIZE) -> int:
@@ -103,12 +109,15 @@ def _max_tokens_for_audio(audio: np.ndarray, frame_size: int = _MIMI_FRAME_SIZE)
     Kyutai emits one text token per audio frame. ``_kyutai_audio_bias_full``
     has shape ``(1 + n_frames, hidden)`` (index 0 is the audio-BOS bias).
     With a 2-token prompt ``[BOS, PAD]`` consuming positions 0 and 1, decode
-    fills positions ``2 .. n_frames``, i.e. ``n_frames - 1`` tokens. Decoding
-    further wanders past ``bias_full`` into zero-bias territory and produces
-    unconditioned text (typically trailing periods).
+    fills positions ``2 .. n_frames``. The feature extractor pads the audio
+    with trailing silence so the model can flush its ~0.5s output delay; we
+    must include those frames in the cap or the last word never makes it
+    out. Decoding past the horizon wanders into zero-bias territory and
+    produces unconditioned text (typically trailing periods), so we don't
+    overshoot.
     """
     n_frames = max(1, len(audio) // frame_size)
-    return max(1, n_frames - 1)
+    return max(1, n_frames + _FE_PAD_FRAMES + _HORIZON_SAFETY_FRAMES - 1)
 
 
 def _build_app(
