@@ -70,17 +70,23 @@ against the longest common prefix.
 
 ## Validated behaviour
 
-Verified end-to-end on `hf_s2s.wav` (39.92 s, voice in the first ~1 s):
+Numbers from `benchmark.py` on `hf_s2s.wav` (39.92 s, voice in the
+first ~1 s) against the 1B checkpoint on a single H100:
 
-* `POST /v1/audio/transcriptions` via `openai.audio.transcriptions.create()`
-  — `'Hello, how is it going?'`.
-* `WS /v1/audio/transcriptions/stream` with real-time pacing —
-  `'Hello, how is it going?'`, RTF ≈ 1.13.
-* `WS /v1/realtime` with real-time pacing —
-  `'Hello, how is it going?'`, RTF ≈ 1.12.
-* 4 concurrent Whisper requests — all 4 return correct transcripts,
-  total wall ≈ 4.3 s (vs ≈ 4.2 s for one), confirming `max_num_seqs > 1`
-  batches them.
+| Scenario                            | TTFT   | Wall    | RTF   |
+|-------------------------------------|--------|---------|-------|
+| `POST /v1/audio/transcriptions`     | n/a    | 2.66 s  | 0.067 |
+| WebSocket, fast upload              | 2.70 s | 2.70 s  | 0.068 |
+| WebSocket, real-time pacing (500 ms commit) | **0.81 s** | 45.04 s | 1.128 |
+| 4× concurrent Whisper POST          | n/a    | 4.34 s  | (3.98× scaling, 100 % perfect) |
+
+* All four scenarios return the same correct transcript.
+* The 0.81 s real-time TTFT is the streaming win: ~500 ms commit interval
+  + ~270 ms encode/decode for the first window + a bit of network. Audio
+  was paced at 1× wall time, so the upload itself takes 39.92 s.
+* The model itself runs at RTF 0.067 — about 15× faster than real time.
+  The real-time scenario's RTF of 1.13 is dominated by upload, not
+  compute.
 
 ## What's still missing for "true Kyutai-style" mid-flight
 
@@ -89,26 +95,46 @@ first-token latency. Kyutai's intended **lockstep** mode emits one text
 token per 80 ms audio frame at ~80 ms per-token wall time. To reach that
 in this implementation we need:
 
-### 1. Scheduler change: don't clear output_token_ids on streaming update
+### 1. Engine-side: allow audio-only streaming updates
 
-vllm-omni already exposes a streaming-input channel:
-`AsyncOmni.generate(prompt=AsyncGenerator[StreamingInput, None])` →
-each yielded chunk becomes an `add_streaming_update_async` to stage 0.
-However, `OmniSchedulerMixin._replace_session_with_streaming_update`
-(in `vllm_omni/core/sched/omni_scheduler_mixin.py`) currently **clears**
-`session._output_token_ids` and resets `num_computed_tokens = 0` on
-every update — it's designed for token-stream prompts that get
-replaced wholesale, not for an audio buffer that grows while the LM
-keeps decoding. For Kyutai we need an "append + keep-going" mode in the
-scheduler that:
-* extends `mm_features` with the new audio frames rather than replacing,
-* leaves the already-decoded text tokens alone,
-* signals to `kyutai_preprocess` to consume the new frames on the next
-  step (already trivial: the hook reads `_kyutai_next_pos` against
-  `_kyutai_audio_bias_full.shape[0]`).
-That's the missing piece for true lockstep. Without it, every
-streaming update functionally restarts the generation, which is what
-our re-submission path already does at the `AsyncOmni.generate` level.
+Investigated the streaming-input channel in detail.
+
+**Good news**: vLLM upstream's `_update_request_as_session` (which
+vllm-omni's STT path inherits, since the `OmniSchedulerMixin` override
+only kicks in for `stage_id != 0`) already does the right thing — it
+folds completed output tokens into the prompt, leaves
+`num_computed_tokens` intact, and extends `mm_features`. So the
+scheduler-level append + KV-cache-preservation semantic IS in place.
+
+**Blocker**: the model-side hook is wired up too — `kyutai_preprocess`
+reads `_kyutai_pending_audio_chunks` from `additional_information` and
+grows the bias buffer. But the path to deliver those chunks fails at
+`vllm.v1.engine.input_processor._validate_prompt_len` which rejects
+streaming updates with empty `prompt_token_ids`. The streaming-input
+mechanism is intrinsically token-stream-shaped; "audio chunk arrived,
+no new tokens" doesn't fit. Possible fixes:
+
+a. **Skip prompt-length validation for streaming updates that carry
+   only `additional_information`.** Targeted change to
+   `vllm_omni.engine.async_omni_engine._build_add_request_message` to
+   bypass `input_processor.process_inputs` when `message_type ==
+   "streaming_update"` AND the prompt has no new tokens. This is the
+   smallest change that unblocks the path; the orchestrator and
+   scheduler already cope.
+b. **Add a side-channel for `additional_information` updates**
+   (separate IPC from the engine that lands directly in the runner's
+   `model_intermediate_buffer`). More invasive but cleaner separation
+   of concerns.
+c. **Fold an extra `[PAD]` per chunk into the streaming-update prompt
+   so it passes validation.** Simplest to implement on the server side
+   but requires the model's preprocess hook to ignore those PADs in
+   its position counter. Mechanically possible; semantically uglier.
+
+The **2-3 % code drift across re-encodes** measured in
+`test_streaming_codec.py` (Mimi's encoder is causal+sliding-window but
+not strictly causal) means even with KV-cache reuse from
+streaming-input, the cached-but-stale KV would be approximate. The
+LM's robustness to that drift is empirical; would need verification.
 
 ### 2. Lossless chunked Mimi encode (or buffered re-encode)
 
@@ -140,11 +166,11 @@ is plumbing it into a `input_audio_buffer.committed` event.
 
 ## Performance characteristics
 
-| Mode                                                | First-token latency | RTF  |
-|-----------------------------------------------------|---------------------|------|
-| Today: re-submission, 500 ms commit window          | ~500 ms             | ~1.1 |
-| With `add_streaming_update_async` + buffered encode | ~80 ms (1 frame)    | <0.5 |
-| Pure lockstep (1 token / frame, no re-decode)       | ~80 ms              | ~0.8 |
+| Mode                                                | First-token latency | RTF (real-time pacing) |
+|-----------------------------------------------------|---------------------|------------------------|
+| Today: re-submission, 500 ms commit window          | **0.81 s measured** | **1.128 measured**     |
+| With audio-only streaming updates + buffered encode | ~270 ms (1 commit cycle of decode) | ~1.0 |
+| Pure lockstep (1 token / frame, no re-decode)       | ~80 ms              | ~0.5                   |
 
 Today the 500 ms commit window is sufficient for "see partials within
 half a second of speaking" but each cycle re-decodes everything, hence
