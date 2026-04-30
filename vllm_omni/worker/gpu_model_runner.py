@@ -1140,34 +1140,27 @@ class OmniGPUModelRunner(GPUModelRunner):
                 for req_id, req_infos in cached_infos.items():
                     self._update_intermediate_buffer(req_id, req_infos)
 
-    def _maybe_attach_mimo_audio_req_infos(
+    def _attach_mm_features_to_req_infos(
         self,
         req_state: CachedRequestState | None,
         req_infos: dict | None,
         req_id: str,
     ) -> dict | None:
-        """Attach MiMoAudio-specific fields into req_infos if applicable.
+        """Surface ``req_state.mm_features`` and the request id on the per-step
+        info bundle that the preprocess hook receives.
 
-        This helper is intentionally small and self-contained so that it can be
-        unit-tested to prevent regressions when updating MiMoAudio handling.
+        Models that opt into the per-step preprocess hook (``has_preprocess=True``)
+        often need to read multimodal data on every step — e.g. Kyutai's
+        per-frame audio bias, or MiMoAudio's interleaved audio embeddings.
+        Always operates on a dict copy so shared instances aren't mutated.
         """
-        # Models with a per-step preprocess hook need ``mm_features``
-        # attached on every step so additive context (e.g. Kyutai's
-        # per-frame audio bias) can be injected.
-        eligible_models = {
-            "MiMoAudioForConditionalGeneration",
-            "KyutaiSpeechToTextForConditionalGeneration",
-        }
-        if req_state is None or self.model.__class__.__name__ not in eligible_models:
+        if req_state is None:
             return req_infos
-
-        # Always operate on a dict copy to avoid mutating shared instances.
         req_infos = dict(req_infos) if isinstance(req_infos, dict) else {}
         mm_features = getattr(req_state, "mm_features", None)
-        if mm_features and (not req_infos.get("mm_features")):
+        if mm_features and not req_infos.get("mm_features"):
             req_infos["mm_features"] = mm_features
         req_infos["req_id"] = req_id
-
         return req_infos
 
     def _preprocess(
@@ -1300,9 +1293,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
-                # mimo-audio check
                 req_state = self.requests.get(req_id)
-                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+                req_infos = self._attach_mm_features_to_req_infos(req_state, req_infos, req_id)
 
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])

@@ -300,14 +300,14 @@ def test_update_intermediate_buffer_skips_unknown_req_id():
     assert "unknown_req" not in runner.model_intermediate_buffer
 
 
-def test_maybe_attach_mimo_audio_req_infos_enriches_dict():
+def test_attach_mm_features_to_req_infos_enriches_dict():
     runner = _make_runner_for_mimo()
     req_id = "r_mimo"
     req_state = runner.requests[req_id]
 
     # Existing req_infos should be copied and enriched, not mutated in place.
     original_req_infos = {"existing": 1}
-    enriched = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(runner, req_state, original_req_infos, req_id)
+    enriched = OmniGPUModelRunner._attach_mm_features_to_req_infos(runner, req_state, original_req_infos, req_id)
 
     assert enriched is not original_req_infos
     assert enriched["existing"] == 1
@@ -317,13 +317,13 @@ def test_maybe_attach_mimo_audio_req_infos_enriches_dict():
     assert enriched["req_id"] == req_id
 
 
-def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
+def test_attach_mm_features_to_req_infos_no_req_state_returns_input():
     runner = _make_runner_for_mimo()
     req_id = "missing"
     req_state = None
     req_infos = {"k": "v"}
 
-    result = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(runner, req_state, req_infos, req_id)
+    result = OmniGPUModelRunner._attach_mm_features_to_req_infos(runner, req_state, req_infos, req_id)
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
