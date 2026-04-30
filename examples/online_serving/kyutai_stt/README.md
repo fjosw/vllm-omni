@@ -95,46 +95,65 @@ first-token latency. Kyutai's intended **lockstep** mode emits one text
 token per 80 ms audio frame at ~80 ms per-token wall time. To reach that
 in this implementation we need:
 
-### 1. Engine-side: allow audio-only streaming updates
+### 1. The architectural finding: vLLM is the wrong abstraction for true lockstep
 
-Investigated the streaming-input channel in detail.
+I worked the streaming-input path end-to-end and confirmed: it is not
+a small patch but an architectural mismatch.
 
-**Good news**: vLLM upstream's `_update_request_as_session` (which
-vllm-omni's STT path inherits, since the `OmniSchedulerMixin` override
-only kicks in for `stage_id != 0`) already does the right thing — it
-folds completed output tokens into the prompt, leaves
-`num_computed_tokens` intact, and extends `mm_features`. So the
-scheduler-level append + KV-cache-preservation semantic IS in place.
+**The reference implementation** (`kyutai-labs/delayed-streams-modeling/scripts/stt_from_file_pytorch.py`)
+is the canonical Kyutai lockstep loop:
 
-**Blocker**: the model-side hook is wired up too — `kyutai_preprocess`
-reads `_kyutai_pending_audio_chunks` from `additional_information` and
-grows the bias buffer. But the path to deliver those chunks fails at
-`vllm.v1.engine.input_processor._validate_prompt_len` which rejects
-streaming updates with empty `prompt_token_ids`. The streaming-input
-mechanism is intrinsically token-stream-shaped; "audio chunk arrived,
-no new tokens" doesn't fit. Possible fixes:
+```python
+with mimi.streaming(1), lm_gen.streaming(1):
+    for audio_chunk in chunks:                  # 1920-sample frames
+        audio_tokens = mimi.encode(audio_chunk)  # streaming codec state
+        text_tokens = lm_gen.step(audio_tokens)  # streaming LM state
+```
 
-a. **Skip prompt-length validation for streaming updates that carry
-   only `additional_information`.** Targeted change to
-   `vllm_omni.engine.async_omni_engine._build_add_request_message` to
-   bypass `input_processor.process_inputs` when `message_type ==
-   "streaming_update"` AND the prompt has no new tokens. This is the
-   smallest change that unblocks the path; the orchestrator and
-   scheduler already cope.
-b. **Add a side-channel for `additional_information` updates**
-   (separate IPC from the engine that lands directly in the runner's
-   `model_intermediate_buffer`). More invasive but cleaner separation
-   of concerns.
-c. **Fold an extra `[PAD]` per chunk into the streaming-update prompt
-   so it passes validation.** Simplest to implement on the server side
-   but requires the model's preprocess hook to ignore those PADs in
-   its position counter. Mechanically possible; semantically uglier.
+There is no engine, no scheduler, no request lifecycle — just direct
+per-frame stepping of (a) the Mimi codec and (b) the LM, both holding
+their own streaming state across calls. That's the "lockstep mode
+Kyutai was originally designed for".
+
+**vLLM's serving model**, by contrast, is request/response: each
+`add_request` represents a self-contained workload that the scheduler
+admits, decodes against KV cache, and finishes. The scheduler at line
+681 of `vllm/v1/core/sched/scheduler.py` literally has
+`assert num_new_tokens > 0` — a request that should "park between
+audio chunks" simply isn't a thing it understands.
+
+I tried three layers of patches to bridge this:
+
+* Bypassed `input_processor._validate_prompt_len` for audio-only
+  streaming updates (cleared the dictionary-shape check).
+* Propagated `additional_information` through
+  `OmniARScheduler._update_request_as_session` so the runner sees new
+  payloads on the next step (cleared the additional-info plumbing).
+* Both reverted in this branch — they hit the deeper
+  `assert num_new_tokens > 0` in upstream vLLM, which is fundamental
+  to how the scheduler works. To make it not assert you'd need to
+  invent a "wait for streaming input" admission state; vllm-omni
+  already has `WAITING_FOR_STREAMING_REQ` for similar purposes but
+  wiring it up for our case requires rewriting the streaming-update
+  semantics throughout.
+
+The model-side hook (`kyutai_preprocess` reading
+`_kyutai_pending_audio_chunks`) survives in this branch as future-
+proofing. The integration that would actually exercise it is a
+non-trivial fork of vllm-omni's streaming-update pipeline — at which
+point you've probably reimplemented half the moshi reference.
+
+**Verdict**: for true Kyutai-style lockstep, the right architecture is
+the moshi reference loop, optionally wrapped with a thin WebSocket
+shim. vLLM gets you "close-to-real-time over a request/response
+abstraction" at the cost of re-decoding redundant work each commit
+window — that's what we have today, and it's the right trade-off if
+you want batched serving across many sessions.
 
 The **2-3 % code drift across re-encodes** measured in
-`test_streaming_codec.py` (Mimi's encoder is causal+sliding-window but
-not strictly causal) means even with KV-cache reuse from
-streaming-input, the cached-but-stale KV would be approximate. The
-LM's robustness to that drift is empirical; would need verification.
+`test_streaming_codec.py` is the same failure mode separately: Mimi's
+encoder isn't strictly causal, so even with KV-cache reuse the
+cached-but-stale early-position KV would be approximate.
 
 ### 2. Lossless chunked Mimi encode (or buffered re-encode)
 
