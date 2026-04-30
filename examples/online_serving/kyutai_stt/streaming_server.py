@@ -37,11 +37,13 @@ from typing import Any
 
 import numpy as np
 import soundfile as sf
+import torch
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 from scipy.signal import resample_poly
 from vllm import SamplingParams
+from vllm.engine.protocol import StreamingInput
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -407,6 +409,152 @@ def _build_app(
                 await websocket.close()
             except Exception:
                 pass
+
+    @app.websocket("/v1/realtime-lockstep")
+    async def realtime_lockstep_endpoint(websocket: WebSocket) -> None:
+        """OpenAI Realtime API mapping with TRUE mid-flight encode.
+
+        Same wire protocol as ``/v1/realtime``. Audio chunks reach the
+        model via ``AsyncOmni.generate(prompt=AsyncGenerator)``: the
+        first yielded ``StreamingInput`` opens the request with the
+        first audio chunk; subsequent yields carry only new audio
+        samples in ``additional_information`` and the model's
+        ``kyutai_preprocess`` hook grows the per-position bias buffer
+        in place. KV cache and already-decoded text survive each
+        update, so per-token cost is bounded by decode time (~10 ms on
+        a 1B/H100) rather than the commit interval.
+        """
+        await websocket.accept()
+        session_id = f"sess_{uuid.uuid4().hex[:12]}"
+        item_id = f"item_{uuid.uuid4().hex[:12]}"
+        request_id = f"{session_id}-stream"
+        await websocket.send_json(
+            {
+                "type": "session.created",
+                "session": {
+                    "id": session_id,
+                    "model": "kyutai-stt",
+                    "modalities": ["text"],
+                    "input_audio_format": "pcm16",
+                },
+            }
+        )
+
+        new_chunks: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
+        committed_text = ""
+
+        async def reader() -> None:
+            try:
+                while True:
+                    msg = await websocket.receive_json()
+                    msg_type = msg.get("type", "")
+                    if msg_type == "input_audio_buffer.append":
+                        await new_chunks.put(_decode_pcm16_le(msg.get("audio", "")))
+                    elif msg_type == "input_audio_buffer.commit":
+                        await new_chunks.put(None)
+                        return
+            except WebSocketDisconnect:
+                await new_chunks.put(None)
+
+        reader_task = asyncio.create_task(reader())
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=max_tokens,
+            seed=42,
+            detokenize=True,
+        )
+
+        async def chunk_generator():
+            first = await new_chunks.get()
+            if first is None:
+                return
+            yield StreamingInput(
+                prompt={
+                    "prompt": "",
+                    "multi_modal_data": {"audio": [first]},
+                },
+                sampling_params=sampling_params,
+            )
+            while True:
+                chunk = await new_chunks.get()
+                if chunk is None:
+                    return
+                pending: list[np.ndarray] = [chunk]
+                while not new_chunks.empty():
+                    try:
+                        nxt = new_chunks.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if nxt is None:
+                        cumulative = np.concatenate(pending)
+                        yield StreamingInput(
+                            prompt={
+                                "additional_information": {
+                                    "_kyutai_pending_audio_chunks": torch.from_numpy(cumulative),
+                                },
+                            },
+                            sampling_params=sampling_params,
+                        )
+                        return
+                    pending.append(nxt)
+                cumulative = np.concatenate(pending) if len(pending) > 1 else pending[0]
+                yield StreamingInput(
+                    prompt={
+                        "additional_information": {
+                            "_kyutai_pending_audio_chunks": torch.from_numpy(cumulative),
+                        },
+                    },
+                    sampling_params=sampling_params,
+                )
+
+        try:
+            async for stage_output in omni.generate(
+                chunk_generator(),
+                request_id=request_id,
+                sampling_params_list=[sampling_params],
+            ):
+                if stage_output.final_output_type != "text":
+                    continue
+                request_output = stage_output.request_output
+                if not request_output.outputs:
+                    continue
+                cycle_text = (request_output.outputs[0].text or "").rstrip()
+                if cycle_text and cycle_text != committed_text:
+                    common = 0
+                    for i in range(min(len(committed_text), len(cycle_text))):
+                        if committed_text[i] != cycle_text[i]:
+                            break
+                        common += 1
+                    delta = cycle_text[common:]
+                    if delta:
+                        await websocket.send_json(
+                            {
+                                "type": "conversation.item.input_audio_transcription.delta",
+                                "item_id": item_id,
+                                "content_index": 0,
+                                "delta": delta,
+                            }
+                        )
+                    committed_text = cycle_text
+        finally:
+            reader_task.cancel()
+            try:
+                await reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        await websocket.send_json(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": item_id,
+                "content_index": 0,
+                "transcript": committed_text,
+            }
+        )
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
     @app.post("/v1/audio/transcriptions")
     async def transcriptions(
