@@ -1033,7 +1033,49 @@ class AsyncOmniEngine:
 
         stage_type = self.stage_metadata[0].get("stage_type")
         _preprocess_ms = 0.0
-        if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
+
+        # Streaming-update fast path: when the update only carries
+        # additional_information (no new tokens, no new mm_features), bypass
+        # input_processor.process_inputs (which validates prompt length) and
+        # build a minimal OmniEngineCoreRequest directly. This is what makes
+        # mid-flight updates without prompt extension possible (e.g. Kyutai
+        # STT delivering audio chunks while the LM keeps decoding).
+        if (
+            message_type == "streaming_update"
+            and stage_type != "diffusion"
+            and not isinstance(prompt, EngineCoreRequest)
+            and isinstance(prompt, dict)
+            and not prompt.get("prompt_token_ids")
+            and not prompt.get("multi_modal_data")
+            and prompt.get("additional_information") is not None
+        ):
+            request = OmniEngineCoreRequest(
+                request_id=request_id,
+                prompt_token_ids=[],
+                mm_features=None,
+                sampling_params=params,
+                pooling_params=None,
+                arrival_time=arrival_time if arrival_time is not None else time.time(),
+                lora_request=lora_request,
+                cache_salt=None,
+                data_parallel_rank=data_parallel_rank,
+                prompt_embeds=None,
+                client_index=0,
+                current_wave=0,
+                priority=priority,
+                trace_headers=trace_headers,
+                resumable=resumable,
+                external_req_id=request_id,
+                reasoning_ended=reasoning_ended,
+                additional_information=serialize_additional_information(
+                    prompt.get("additional_information"),
+                    log_prefix="AsyncOmniEngine[streaming_update_passthrough]",
+                ),
+            )
+            request = _apply_omni_final_stage_metadata(request, final_stage_id)
+            prompt = request
+
+        elif stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
                 _inject_global_id(prompt, request_id)

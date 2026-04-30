@@ -578,6 +578,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         else:
             super()._update_request_as_session(session, update)
+            # Propagate additional_information so models that consume per-step
+            # state via the model_intermediate_buffer (e.g. Kyutai STT delivering
+            # audio chunks mid-flight) see the new payload on the next step. The
+            # upstream parent leaves additional_information untouched because
+            # text-only streaming sessions don't need it.
+            extra = getattr(update, "additional_information", None)
+            if extra is not None:
+                session.additional_information = extra
 
     def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
