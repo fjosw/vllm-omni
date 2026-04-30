@@ -5,20 +5,10 @@ from aenum import extend_enum
 from vllm.config import ModelConfig as _OriginalModelConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
 
-# =============================================================================
-# Patch MODEL_ARCH_CONFIG_CONVERTORS to widen Kyutai STT's input vocab
-# =============================================================================
-# WHY: Kyutai STT's *input* embedding table covers text + per-codebook
-# audio tokens + a pad row, but the LM head outputs over the text vocab
-# only. vLLM's input-id validator and prefill bookkeeping read
-# ``ModelConfig.get_vocab_size()`` (= ``model_arch_config.vocab_size``,
-# copied from ``hf_config.vocab_size`` at ``ModelConfig.__init__``
-# time). Without widening, the audio-pad placeholder (id 69569) and the
-# BOS (id 48000) are flagged as out-of-vocabulary. We register a
-# convertor for ``model_type == "kyutai_speech_to_text"`` that returns
-# the embedding-table size for input validation while preserving the
-# original text-vocab size on ``config.text_vocab_size`` for the LM
-# head.
+# Widen Kyutai STT's vocab_size to the full embedding-table extent (text vocab
+# + per-codebook audio rows + a pad row) so vLLM's input-id validator accepts
+# the audio-pad placeholder (id 69569) and BOS (id 48000). The LM head still
+# uses the original text vocab via ``config.text_vocab_size``.
 try:
     from vllm.transformers_utils.model_arch_config_convertor import (
         MODEL_ARCH_CONFIG_CONVERTORS,

@@ -380,68 +380,34 @@ class KyutaiSpeechToTextForConditionalGeneration(
                 loaded.add(f"codec_model.{n}")
         return loaded
 
-    def _audio_bos_bias(self, device: torch.device) -> torch.Tensor:
-        """One-row tensor placed at position 0 of the audio bias buffer."""
-        embed = self.model.embed_tokens
-        bos_codes = torch.full(
-            (1, embed.num_codebooks),
-            int(self.config.audio_bos_token_id),
-            dtype=torch.long,
-            device=device,
-        )
-        return embed.embed_audio_only(bos_codes)
-
     @torch.no_grad()
-    def _encode_audio(
-        self,
-        input_values: torch.Tensor,
-        device: torch.device,
-        state: dict[str, object] | None = None,
-    ) -> torch.Tensor:
-        """Run the Mimi encoder on a (chunk of) waveform and return the
-        per-frame additive bias of shape ``(T, hidden_size)``.
+    def _compute_audio_bias_full(self, input_values: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Run the Mimi codec on the padded waveform and pre-compute the
+        additive bias for every generation position.
 
-        When ``state`` is provided it is treated as a persistent Mimi
-        streaming context: ``state["padding_cache"]`` and
-        ``state["encoder_past"]`` are read and updated in place so
-        successive calls compose into the same total frame stream as a
-        single one-shot encode would have produced. Pass ``state=None``
-        for the offline one-shot path.
+        Output shape ``(1 + T, hidden_size)``: index 0 holds the audio-BOS
+        bias (used at the BOS position); indices 1..T hold the per-frame
+        biases. The dtype follows the codec parameters (typically fp32 even
+        when the LM runs in bf16) so the per-step LM add keeps the higher-
+        precision summation; the runner casts back to its bf16 buffer at
+        write-time.
         """
-        # Match the codec's parameter dtype (its conv biases reject
-        # mixed-dtype inputs); the LM-side add is done in the codec dtype
-        # to preserve precision and the runner casts back to its bf16
-        # buffer at write-time.
         codec_dtype = next(self.codec_model.parameters()).dtype
         iv = input_values.to(device=device, dtype=codec_dtype)
         if iv.dim() == 2:
             iv = iv.unsqueeze(0)
-
-        if state is None:
-            codes = self.codec_model.encode(iv).audio_codes  # (1, num_codebooks, T)
-        else:
-            out = self.codec_model.encode(
-                iv,
-                padding_cache=state.get("padding_cache"),
-                encoder_past_key_values=state.get("encoder_past"),
-                use_streaming=True,
-                return_dict=True,
-            )
-            codes = out.audio_codes
-            state["padding_cache"] = out.padding_cache
-            state["encoder_past"] = out.encoder_past_key_values
-
-        if codes.shape[-1] == 0:
-            return torch.empty(0, self.config.hidden_size, dtype=codec_dtype, device=device)
+        codes = self.codec_model.encode(iv).audio_codes  # (1, num_codebooks, T)
         codes = codes[0].transpose(0, 1).contiguous()  # (T, num_codebooks)
-        return self.model.embed_tokens.embed_audio_only(codes)
 
-    @torch.no_grad()
-    def _compute_audio_bias_full(self, input_values: torch.Tensor, device: torch.device) -> torch.Tensor:
-        """One-shot bias for the full waveform. Output ``(1+T, hidden_size)``:
-        index 0 is the audio-BOS bias; indices 1..T are the per-frame biases."""
-        per_frame = self._encode_audio(input_values, device=device)
-        return torch.cat([self._audio_bos_bias(device), per_frame], dim=0)
+        embed = self.model.embed_tokens
+        per_frame = embed.embed_audio_only(codes)
+        bos_codes = torch.full(
+            (1, embed.num_codebooks),
+            int(self.config.audio_bos_token_id),
+            dtype=codes.dtype,
+            device=codes.device,
+        )
+        return torch.cat([embed.embed_audio_only(bos_codes), per_frame], dim=0)
 
     def kyutai_preprocess(
         self,
