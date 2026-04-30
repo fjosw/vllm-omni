@@ -489,6 +489,7 @@ def _build_app(
                         cumulative = np.concatenate(pending)
                         yield StreamingInput(
                             prompt={
+                                "prompt_token_ids": [],
                                 "additional_information": {
                                     "_kyutai_pending_audio_chunks": torch.from_numpy(cumulative),
                                 },
@@ -500,6 +501,7 @@ def _build_app(
                 cumulative = np.concatenate(pending) if len(pending) > 1 else pending[0]
                 yield StreamingInput(
                     prompt={
+                        "prompt_token_ids": [],
                         "additional_information": {
                             "_kyutai_pending_audio_chunks": torch.from_numpy(cumulative),
                         },
