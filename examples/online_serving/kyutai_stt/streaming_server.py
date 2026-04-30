@@ -94,12 +94,29 @@ class _SessionState:
         return _resample_to(audio, int(self.input_sr or self.target_sr), self.target_sr)
 
 
+_MIMI_FRAME_SIZE = 1920  # samples per Mimi frame at 24 kHz / 12.5 Hz
+
+
+def _max_tokens_for_audio(audio: np.ndarray, frame_size: int = _MIMI_FRAME_SIZE) -> int:
+    """Cap decode length to the audio horizon.
+
+    Kyutai emits one text token per audio frame. ``_kyutai_audio_bias_full``
+    has shape ``(1 + n_frames, hidden)`` (index 0 is the audio-BOS bias).
+    With a 2-token prompt ``[BOS, PAD]`` consuming positions 0 and 1, decode
+    fills positions ``2 .. n_frames``, i.e. ``n_frames - 1`` tokens. Decoding
+    further wanders past ``bias_full`` into zero-bias territory and produces
+    unconditioned text (typically trailing periods).
+    """
+    n_frames = max(1, len(audio) // frame_size)
+    return max(1, n_frames - 1)
+
+
 def _build_app(
     omni: AsyncOmni,
     *,
     target_sr: int = 24000,
     commit_interval_ms: int = 800,
-    max_tokens: int = 374,
+    max_tokens_cap: int = 4096,
 ) -> FastAPI:
     app = FastAPI()
 
@@ -168,7 +185,7 @@ def _build_app(
                     audio = session.cumulative_audio()
                     sampling_params = SamplingParams(
                         temperature=0.0,
-                        max_tokens=max_tokens,
+                        max_tokens=min(max_tokens_cap, _max_tokens_for_audio(audio)),
                         seed=42,
                         detokenize=True,
                     )
@@ -343,7 +360,7 @@ def _build_app(
                 audio = session.cumulative_audio()
                 sampling_params = SamplingParams(
                     temperature=0.0,
-                    max_tokens=max_tokens,
+                    max_tokens=min(max_tokens_cap, _max_tokens_for_audio(audio)),
                     seed=42,
                     detokenize=True,
                 )
@@ -438,7 +455,7 @@ def _build_app(
         request_id = f"stt-rest-{uuid.uuid4().hex[:8]}"
         sampling_params = SamplingParams(
             temperature=0.0,
-            max_tokens=max_tokens,
+            max_tokens=min(max_tokens_cap, _max_tokens_for_audio(audio)),
             seed=42,
             detokenize=True,
         )
